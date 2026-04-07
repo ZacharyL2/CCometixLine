@@ -69,6 +69,8 @@ pub enum SegmentId {
     Git,
     ContextWindow,
     Usage,
+    #[serde(rename = "usage_7d")]
+    Usage7d,
     Cost,
     Session,
     OutputStyle,

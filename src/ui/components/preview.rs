@@ -137,8 +137,13 @@ impl PreviewComponent {
                     },
                 },
                 SegmentId::Usage => SegmentData {
-                    primary: "24%".to_string(),
-                    secondary: "· 10-7-2".to_string(),
+                    primary: "13%".to_string(),
+                    secondary: "↻3h20m".to_string(),
+                    metadata: HashMap::new(),
+                },
+                SegmentId::Usage7d => SegmentData {
+                    primary: "26%".to_string(),
+                    secondary: "↻5d2h".to_string(),
                     metadata: HashMap::new(),
                 },
                 SegmentId::Cost => SegmentData {

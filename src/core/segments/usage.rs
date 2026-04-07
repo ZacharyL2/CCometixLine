@@ -1,9 +1,12 @@
 use super::{Segment, SegmentData};
-use crate::config::{InputData, SegmentId};
+use crate::config::{InputData, SegmentId, TranscriptEntry};
 use crate::utils::credentials;
-use chrono::{DateTime, Datelike, Duration, Local, Timelike, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 struct ApiUsageResponse {
@@ -21,48 +24,97 @@ struct UsagePeriod {
 struct ApiUsageCache {
     five_hour_utilization: f64,
     seven_day_utilization: f64,
-    resets_at: Option<String>,
+    five_hour_resets_at: Option<String>,
+    seven_day_resets_at: Option<String>,
     cached_at: String,
+    #[serde(default)]
+    tokens_at_sync: u32,
 }
 
-#[derive(Default)]
-pub struct UsageSegment;
+// Shared utilities for both usage segments
+struct UsageUtils;
 
-impl UsageSegment {
-    pub fn new() -> Self {
-        Self
-    }
-
+impl UsageUtils {
+    #[allow(dead_code)]
     fn get_circle_icon(utilization: f64) -> String {
         let percent = (utilization * 100.0) as u8;
         match percent {
-            0..=12 => "\u{f0a9e}".to_string(),  // circle_slice_1
-            13..=25 => "\u{f0a9f}".to_string(), // circle_slice_2
-            26..=37 => "\u{f0aa0}".to_string(), // circle_slice_3
-            38..=50 => "\u{f0aa1}".to_string(), // circle_slice_4
-            51..=62 => "\u{f0aa2}".to_string(), // circle_slice_5
-            63..=75 => "\u{f0aa3}".to_string(), // circle_slice_6
-            76..=87 => "\u{f0aa4}".to_string(), // circle_slice_7
-            _ => "\u{f0aa5}".to_string(),       // circle_slice_8
+            0..=12 => "\u{f0a9e}".to_string(),
+            13..=25 => "\u{f0a9f}".to_string(),
+            26..=37 => "\u{f0aa0}".to_string(),
+            38..=50 => "\u{f0aa1}".to_string(),
+            51..=62 => "\u{f0aa2}".to_string(),
+            63..=75 => "\u{f0aa3}".to_string(),
+            76..=87 => "\u{f0aa4}".to_string(),
+            _ => "\u{f0aa5}".to_string(),
         }
     }
 
-    fn format_reset_time(reset_time_str: Option<&str>) -> String {
+    fn format_remaining_time(reset_time_str: Option<&str>) -> String {
         if let Some(time_str) = reset_time_str {
             if let Ok(dt) = DateTime::parse_from_rfc3339(time_str) {
-                let mut local_dt = dt.with_timezone(&Local);
-                if local_dt.minute() > 45 {
-                    local_dt += Duration::hours(1);
+                let now = Utc::now();
+                let reset = dt.with_timezone(&Utc);
+                let remaining = reset.signed_duration_since(now);
+                let total_secs = remaining.num_seconds();
+
+                if total_secs <= 0 {
+                    return "soon".to_string();
                 }
-                return format!(
-                    "{}-{}-{}",
-                    local_dt.month(),
-                    local_dt.day(),
-                    local_dt.hour()
-                );
+
+                let hours = total_secs / 3600;
+                let minutes = (total_secs % 3600) / 60;
+
+                if hours > 24 {
+                    let days = hours / 24;
+                    let rem_hours = hours % 24;
+                    return format!("{}d{}h", days, rem_hours);
+                } else if hours > 0 {
+                    return format!("{}h{}m", hours, minutes);
+                } else {
+                    return format!("{}m", minutes);
+                }
             }
         }
         "?".to_string()
+    }
+
+    fn get_current_transcript_tokens(transcript_path: &str) -> u32 {
+        let path = Path::new(transcript_path);
+        let file = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+        let reader = BufReader::new(file);
+        let lines: Vec<String> = reader
+            .lines()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_default();
+
+        for line in lines.iter().rev() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(line) {
+                if entry.r#type.as_deref() == Some("assistant") {
+                    if let Some(message) = &entry.message {
+                        if let Some(raw_usage) = &message.usage {
+                            let normalized = raw_usage.clone().normalize();
+                            return normalized.display_tokens();
+                        }
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    fn estimate_usage_increase(token_delta: u32) -> (f64, f64) {
+        let delta = token_delta as f64;
+        let five_hour_increase = delta / 50_000.0;
+        let seven_day_increase = delta / 350_000.0;
+        (five_hour_increase, seven_day_increase)
     }
 
     fn get_cache_path() -> Option<std::path::PathBuf> {
@@ -74,17 +126,16 @@ impl UsageSegment {
         )
     }
 
-    fn load_cache(&self) -> Option<ApiUsageCache> {
+    fn load_cache() -> Option<ApiUsageCache> {
         let cache_path = Self::get_cache_path()?;
         if !cache_path.exists() {
             return None;
         }
-
         let content = std::fs::read_to_string(&cache_path).ok()?;
         serde_json::from_str(&content).ok()
     }
 
-    fn save_cache(&self, cache: &ApiUsageCache) {
+    fn save_cache(cache: &ApiUsageCache) {
         if let Some(cache_path) = Self::get_cache_path() {
             if let Some(parent) = cache_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -95,9 +146,22 @@ impl UsageSegment {
         }
     }
 
-    fn is_cache_valid(&self, cache: &ApiUsageCache, cache_duration: u64) -> bool {
+    fn is_cache_valid(cache: &ApiUsageCache, cache_duration: u64) -> bool {
+        let now = Utc::now();
+
+        // If any reset time has passed, cache is invalid — need fresh data
+        for reset_str in [&cache.five_hour_resets_at, &cache.seven_day_resets_at].iter() {
+            if let Some(ref time_str) = reset_str {
+                if let Ok(dt) = DateTime::parse_from_rfc3339(time_str) {
+                    if now >= dt.with_timezone(&Utc) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Otherwise use normal cache duration
         if let Ok(cached_at) = DateTime::parse_from_rfc3339(&cache.cached_at) {
-            let now = Utc::now();
             let elapsed = now.signed_duration_since(cached_at.with_timezone(&Utc));
             elapsed.num_seconds() < cache_duration as i64
         } else {
@@ -107,11 +171,9 @@ impl UsageSegment {
 
     fn get_claude_code_version() -> String {
         use std::process::Command;
-
         let output = Command::new("npm")
             .args(["view", "@anthropic-ai/claude-code", "version"])
             .output();
-
         match output {
             Ok(output) if output.status.success() => {
                 let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -121,7 +183,6 @@ impl UsageSegment {
             }
             _ => {}
         }
-
         "claude-code".to_string()
     }
 
@@ -130,11 +191,8 @@ impl UsageSegment {
             .or_else(|_| std::env::var("USERPROFILE"))
             .ok()?;
         let settings_path = format!("{}/.claude/settings.json", home);
-
         let content = std::fs::read_to_string(&settings_path).ok()?;
         let settings: serde_json::Value = serde_json::from_str(&content).ok()?;
-
-        // Try HTTPS_PROXY first, then HTTP_PROXY
         settings
             .get("env")?
             .get("HTTPS_PROXY")
@@ -143,12 +201,7 @@ impl UsageSegment {
             .map(|s| s.to_string())
     }
 
-    fn fetch_api_usage(
-        &self,
-        api_base_url: &str,
-        token: &str,
-        timeout_secs: u64,
-    ) -> Option<ApiUsageResponse> {
+    fn fetch_api_usage(api_base_url: &str, token: &str, timeout_secs: u64) -> Option<ApiUsageResponse> {
         let url = format!("{}/api/oauth/usage", api_base_url);
         let user_agent = Self::get_claude_code_version();
 
@@ -178,15 +231,15 @@ impl UsageSegment {
 
         response.into_body().read_json().ok()
     }
-}
 
-impl Segment for UsageSegment {
-    fn collect(&self, _input: &InputData) -> Option<SegmentData> {
+    /// Fetch or use cached usage data, returns (5h_util, 7d_util, 5h_resets, 7d_resets)
+    fn get_usage_data(input: &InputData) -> Option<(f64, f64, Option<String>, Option<String>)> {
         let token = credentials::get_oauth_token()?;
 
-        // Load config from file to get segment options
         let config = crate::config::Config::load().ok()?;
-        let segment_config = config.segments.iter().find(|s| s.id == SegmentId::Usage);
+        // Look for usage or usage_7d segment config for settings
+        let segment_config = config.segments.iter()
+            .find(|s| s.id == SegmentId::Usage || s.id == SegmentId::Usage7d);
 
         let api_base_url = segment_config
             .and_then(|sc| sc.options.get("api_base_url"))
@@ -203,64 +256,79 @@ impl Segment for UsageSegment {
             .and_then(|v| v.as_u64())
             .unwrap_or(2);
 
-        let cached_data = self.load_cache();
+        let current_tokens = Self::get_current_transcript_tokens(&input.transcript_path);
+
+        let cached_data = Self::load_cache();
         let use_cached = cached_data
             .as_ref()
-            .map(|cache| self.is_cache_valid(cache, cache_duration))
+            .map(|cache| Self::is_cache_valid(cache, cache_duration))
             .unwrap_or(false);
 
-        let (five_hour_util, seven_day_util, resets_at) = if use_cached {
+        if use_cached {
             let cache = cached_data.unwrap();
-            (
-                cache.five_hour_utilization,
-                cache.seven_day_utilization,
-                cache.resets_at,
-            )
+            let token_delta = current_tokens.saturating_sub(cache.tokens_at_sync);
+            let (five_inc, seven_inc) = Self::estimate_usage_increase(token_delta);
+            Some((
+                (cache.five_hour_utilization + five_inc).min(100.0),
+                (cache.seven_day_utilization + seven_inc).min(100.0),
+                cache.five_hour_resets_at,
+                cache.seven_day_resets_at,
+            ))
         } else {
-            match self.fetch_api_usage(api_base_url, &token, timeout) {
+            match Self::fetch_api_usage(api_base_url, &token, timeout) {
                 Some(response) => {
                     let cache = ApiUsageCache {
                         five_hour_utilization: response.five_hour.utilization,
                         seven_day_utilization: response.seven_day.utilization,
-                        resets_at: response.seven_day.resets_at.clone(),
+                        five_hour_resets_at: response.five_hour.resets_at.clone(),
+                        seven_day_resets_at: response.seven_day.resets_at.clone(),
                         cached_at: Utc::now().to_rfc3339(),
+                        tokens_at_sync: current_tokens,
                     };
-                    self.save_cache(&cache);
-                    (
+                    Self::save_cache(&cache);
+                    Some((
                         response.five_hour.utilization,
                         response.seven_day.utilization,
+                        response.five_hour.resets_at,
                         response.seven_day.resets_at,
-                    )
+                    ))
                 }
                 None => {
-                    if let Some(cache) = cached_data {
-                        (
-                            cache.five_hour_utilization,
-                            cache.seven_day_utilization,
-                            cache.resets_at,
-                        )
-                    } else {
-                        return None;
-                    }
+                    cached_data.map(|cache| (
+                        cache.five_hour_utilization,
+                        cache.seven_day_utilization,
+                        cache.five_hour_resets_at,
+                        cache.seven_day_resets_at,
+                    ))
                 }
             }
-        };
+        }
+    }
+}
 
-        let dynamic_icon = Self::get_circle_icon(seven_day_util / 100.0);
-        let five_hour_percent = five_hour_util.round() as u8;
-        let primary = format!("{}%", five_hour_percent);
-        let secondary = format!("· {}", Self::format_reset_time(resets_at.as_deref()));
+// ============ 5h Usage Segment ============
 
-        let mut metadata = HashMap::new();
-        metadata.insert("dynamic_icon".to_string(), dynamic_icon);
-        metadata.insert(
-            "five_hour_utilization".to_string(),
-            five_hour_util.to_string(),
-        );
-        metadata.insert(
-            "seven_day_utilization".to_string(),
-            seven_day_util.to_string(),
-        );
+#[derive(Default)]
+pub struct UsageSegment;
+
+impl UsageSegment {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Segment for UsageSegment {
+    fn collect(&self, input: &InputData) -> Option<SegmentData> {
+        let (five_hour_util, _seven_day_util, five_hour_resets_at, _) =
+            UsageUtils::get_usage_data(input)?;
+
+        let percent = five_hour_util.round() as u8;
+        let remaining = UsageUtils::format_remaining_time(five_hour_resets_at.as_deref());
+
+        let primary = format!("{}%", percent);
+        let secondary = format!("· {}", remaining);
+
+        let metadata = HashMap::new();
 
         Some(SegmentData {
             primary,
@@ -271,5 +339,41 @@ impl Segment for UsageSegment {
 
     fn id(&self) -> SegmentId {
         SegmentId::Usage
+    }
+}
+
+// ============ 7d Usage Segment ============
+
+#[derive(Default)]
+pub struct Usage7dSegment;
+
+impl Usage7dSegment {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Segment for Usage7dSegment {
+    fn collect(&self, input: &InputData) -> Option<SegmentData> {
+        let (_five_hour_util, seven_day_util, _, seven_day_resets_at) =
+            UsageUtils::get_usage_data(input)?;
+
+        let percent = seven_day_util.round() as u8;
+        let remaining = UsageUtils::format_remaining_time(seven_day_resets_at.as_deref());
+
+        let primary = format!("{}%", percent);
+        let secondary = format!("· {}", remaining);
+
+        let metadata = HashMap::new();
+
+        Some(SegmentData {
+            primary,
+            secondary,
+            metadata,
+        })
+    }
+
+    fn id(&self) -> SegmentId {
+        SegmentId::Usage7d
     }
 }
