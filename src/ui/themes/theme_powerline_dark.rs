@@ -253,7 +253,7 @@ pub fn usage_segment() -> SegmentConfig {
                 "cache_duration".to_string(),
                 serde_json::Value::Number(180.into()),
             );
-            opts.insert("timeout".to_string(), serde_json::Value::Number(2.into()));
+            opts.insert("timeout".to_string(), serde_json::Value::Number(5.into()));
             opts
         },
     }

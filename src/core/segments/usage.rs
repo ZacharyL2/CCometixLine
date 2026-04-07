@@ -5,8 +5,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::sync::OnceLock;
+
+type UsageResult = Option<(f64, f64, Option<String>, Option<String>)>;
+static USAGE_CACHE: OnceLock<UsageResult> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 struct ApiUsageResponse {
@@ -35,6 +39,23 @@ struct ApiUsageCache {
 struct UsageUtils;
 
 impl UsageUtils {
+    fn log_api_event(message: &str) {
+        let log_path = dirs::home_dir()
+            .map(|h| h.join(".claude").join("ccline").join("api_usage.log"));
+        if let Some(path) = log_path {
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let now = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+                let _ = writeln!(file, "[{}] {}", now, message);
+            }
+        }
+    }
+}
+
+impl UsageUtils {
     #[allow(dead_code)]
     fn get_circle_icon(utilization: f64) -> String {
         let percent = (utilization * 100.0) as u8;
@@ -50,33 +71,39 @@ impl UsageUtils {
         }
     }
 
-    fn format_remaining_time(reset_time_str: Option<&str>) -> String {
-        if let Some(time_str) = reset_time_str {
+    /// Format remaining time until reset.
+    /// `fallback_hours`: when `resets_at` is null, assume this many hours as the window size.
+    fn format_remaining_time(reset_time_str: Option<&str>, fallback_hours: Option<u64>) -> String {
+        let total_secs = if let Some(time_str) = reset_time_str {
             if let Ok(dt) = DateTime::parse_from_rfc3339(time_str) {
-                let now = Utc::now();
-                let reset = dt.with_timezone(&Utc);
-                let remaining = reset.signed_duration_since(now);
-                let total_secs = remaining.num_seconds();
-
-                if total_secs <= 0 {
+                let remaining = dt.with_timezone(&Utc).signed_duration_since(Utc::now());
+                let secs = remaining.num_seconds();
+                if secs <= 0 {
                     return "soon".to_string();
                 }
-
-                let hours = total_secs / 3600;
-                let minutes = (total_secs % 3600) / 60;
-
-                if hours > 24 {
-                    let days = hours / 24;
-                    let rem_hours = hours % 24;
-                    return format!("{}d{}h", days, rem_hours);
-                } else if hours > 0 {
-                    return format!("{}h{}m", hours, minutes);
-                } else {
-                    return format!("{}m", minutes);
-                }
+                secs
+            } else {
+                return "?".to_string();
             }
+        } else if let Some(hours) = fallback_hours {
+            // API returned null resets_at — use window size as approximate remaining
+            (hours * 3600) as i64
+        } else {
+            return "?".to_string();
+        };
+
+        let hours = total_secs / 3600;
+        let minutes = (total_secs % 3600) / 60;
+
+        if hours > 24 {
+            let days = hours / 24;
+            let rem_hours = hours % 24;
+            format!("{}d{}h", days, rem_hours)
+        } else if hours > 0 {
+            format!("{}h{}m", hours, minutes)
+        } else {
+            format!("{}m", minutes)
         }
-        "?".to_string()
     }
 
     fn get_current_transcript_tokens(transcript_path: &str) -> u32 {
@@ -218,7 +245,9 @@ impl UsageUtils {
             ureq::Agent::new_with_defaults()
         };
 
-        let response = agent
+        Self::log_api_event(&format!("API_REQUEST url={} timeout={}s", url, timeout_secs));
+
+        let result = agent
             .get(&url)
             .header("Authorization", &format!("Bearer {}", token))
             .header("anthropic-beta", "oauth-2025-04-20")
@@ -226,14 +255,38 @@ impl UsageUtils {
             .config()
             .timeout_global(Some(std::time::Duration::from_secs(timeout_secs)))
             .build()
-            .call()
-            .ok()?;
+            .call();
 
-        response.into_body().read_json().ok()
+        match result {
+            Ok(response) => {
+                match response.into_body().read_json::<ApiUsageResponse>() {
+                    Ok(data) => {
+                        Self::log_api_event(&format!(
+                            "API_SUCCESS 5h={:.1}% 7d={:.1}%",
+                            data.five_hour.utilization, data.seven_day.utilization
+                        ));
+                        Some(data)
+                    }
+                    Err(e) => {
+                        Self::log_api_event(&format!("API_PARSE_ERROR {}", e));
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                Self::log_api_event(&format!("API_FETCH_ERROR {}", e));
+                None
+            }
+        }
+    }
+
+    /// Get usage data, shared across 5h and 7d segments (called once per process)
+    fn get_usage_data_shared(input: &InputData) -> UsageResult {
+        USAGE_CACHE.get_or_init(|| Self::get_usage_data_inner(input)).clone()
     }
 
     /// Fetch or use cached usage data, returns (5h_util, 7d_util, 5h_resets, 7d_resets)
-    fn get_usage_data(input: &InputData) -> Option<(f64, f64, Option<String>, Option<String>)> {
+    fn get_usage_data_inner(input: &InputData) -> Option<(f64, f64, Option<String>, Option<String>)> {
         let token = credentials::get_oauth_token()?;
 
         let config = crate::config::Config::load().ok()?;
@@ -254,7 +307,7 @@ impl UsageUtils {
         let timeout = segment_config
             .and_then(|sc| sc.options.get("timeout"))
             .and_then(|v| v.as_u64())
-            .unwrap_or(2);
+            .unwrap_or(5);
 
         let current_tokens = Self::get_current_transcript_tokens(&input.transcript_path);
 
@@ -268,6 +321,10 @@ impl UsageUtils {
             let cache = cached_data.unwrap();
             let token_delta = current_tokens.saturating_sub(cache.tokens_at_sync);
             let (five_inc, seven_inc) = Self::estimate_usage_increase(token_delta);
+            Self::log_api_event(&format!(
+                "CACHE_HIT cached_5h={:.1}% est_inc={:.1}% tokens={} delta={}",
+                cache.five_hour_utilization, five_inc, current_tokens, token_delta
+            ));
             Some((
                 (cache.five_hour_utilization + five_inc).min(100.0),
                 (cache.seven_day_utilization + seven_inc).min(100.0),
@@ -275,6 +332,10 @@ impl UsageUtils {
                 cache.seven_day_resets_at,
             ))
         } else {
+            Self::log_api_event(&format!(
+                "CACHE_MISS has_stale={} cache_duration={}s",
+                cached_data.is_some(), cache_duration
+            ));
             match Self::fetch_api_usage(api_base_url, &token, timeout) {
                 Some(response) => {
                     let cache = ApiUsageCache {
@@ -294,12 +355,23 @@ impl UsageUtils {
                     ))
                 }
                 None => {
-                    cached_data.map(|cache| (
-                        cache.five_hour_utilization,
-                        cache.seven_day_utilization,
-                        cache.five_hour_resets_at,
-                        cache.seven_day_resets_at,
-                    ))
+                    Self::log_api_event("FALLBACK using stale cache with local estimation");
+                    cached_data.map(|cache| {
+                        let token_delta = current_tokens.saturating_sub(cache.tokens_at_sync);
+                        let (five_inc, seven_inc) = Self::estimate_usage_increase(token_delta);
+                        // Update cached_at so we don't hammer the API on every call
+                        let refreshed = ApiUsageCache {
+                            cached_at: Utc::now().to_rfc3339(),
+                            ..cache
+                        };
+                        Self::save_cache(&refreshed);
+                        (
+                            (refreshed.five_hour_utilization + five_inc).min(100.0),
+                            (refreshed.seven_day_utilization + seven_inc).min(100.0),
+                            refreshed.five_hour_resets_at,
+                            refreshed.seven_day_resets_at,
+                        )
+                    })
                 }
             }
         }
@@ -320,10 +392,10 @@ impl UsageSegment {
 impl Segment for UsageSegment {
     fn collect(&self, input: &InputData) -> Option<SegmentData> {
         let (five_hour_util, _seven_day_util, five_hour_resets_at, _) =
-            UsageUtils::get_usage_data(input)?;
+            UsageUtils::get_usage_data_shared(input)?;
 
         let percent = five_hour_util.round() as u8;
-        let remaining = UsageUtils::format_remaining_time(five_hour_resets_at.as_deref());
+        let remaining = UsageUtils::format_remaining_time(five_hour_resets_at.as_deref(), Some(5));
 
         let primary = format!("{}%", percent);
         let secondary = format!("· {}", remaining);
@@ -356,10 +428,10 @@ impl Usage7dSegment {
 impl Segment for Usage7dSegment {
     fn collect(&self, input: &InputData) -> Option<SegmentData> {
         let (_five_hour_util, seven_day_util, _, seven_day_resets_at) =
-            UsageUtils::get_usage_data(input)?;
+            UsageUtils::get_usage_data_shared(input)?;
 
         let percent = seven_day_util.round() as u8;
-        let remaining = UsageUtils::format_remaining_time(seven_day_resets_at.as_deref());
+        let remaining = UsageUtils::format_remaining_time(seven_day_resets_at.as_deref(), Some(168));
 
         let primary = format!("{}%", percent);
         let secondary = format!("· {}", remaining);
